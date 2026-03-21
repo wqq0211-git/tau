@@ -1,3 +1,4 @@
+import time
 import jax.numpy as jnp
 from jax import random
 import mujoco
@@ -34,15 +35,22 @@ class SimWalkEnv():
         self.r_foot_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, r_foot_name)
         self.l_foot_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, l_foot_name)
         self.root_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, root_name)
-        #self.r_force_sensor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, r_force_sensor_name)
-        #self.l_force_sensor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, l_force_sensor_name)
+        self.l_foot_touch_sensor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, 'left_foot_touch')
+        self.r_foot_touch_sensor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, 'right_foot_touch')
+        self.l_foot_touch_adr = int(self.model.sensor_adr[self.l_foot_touch_sensor_id])
+        self.r_foot_touch_adr = int(self.model.sensor_adr[self.r_foot_touch_sensor_id])
         self.gear_ratios = self.model.actuator_gear[:, 0]
         # print(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, 14))
         # print(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, 21))
         self.frame_skip = int(self.control_dt / self.sim_dt)
+        self.gravity = abs(self.model.opt.gravity[2])
         self.mass = mujoco.mj_getTotalmass(self.model)
-        self.kp0 = jnp.array([110, 110, 110, 120, 40, 20,
-                              110, 110, 110, 120, 40, 20,
+        self.body_weight = self.mass * self.gravity
+        self.double_support_foot_frc = 0.5 * self.body_weight
+        self.single_support_foot_frc = self.body_weight
+        self.desired_max_foot_frc = 1.2 * self.body_weight
+        self.kp0 = jnp.array([110, 110, 110, 130, 40, 20,
+                              110, 110, 110, 130, 40, 20,
                               110, 110, 110,
                               90, 90, 90, 80, 60, 60, 60,
                               90, 90, 90, 80, 60, 60, 60,]) / self.gear_ratios
@@ -50,7 +58,10 @@ class SimWalkEnv():
         self.init_qvel = jnp.zeros(self.model.nv)
         self.init_qpos = jnp.concatenate([jnp.array([0, 0, self.goal_h, 1, 0, 0, 0]), self.motor_offset])
         self.time=0
-        self.desired_max_foot_frc = self.mass * 9.8 * 0.5
+        self.l_foot_force = 0.0
+        self.r_foot_force = 0.0
+        self.l_force_z0 = 0.0
+        self.r_force_z0 = 0.0
 
     def init_viewer(self):
         self.viewer.cam.trackbodyid = 1
@@ -60,6 +71,12 @@ class SimWalkEnv():
         self.viewer.cam.elevation = -20
         self.viewer.vopt.geomgroup[0] = 1
         self.viewer._render_every_frame = True
+
+    def update_foot_force_state(self):
+        self.l_foot_force = float(self.data.sensordata[self.l_foot_touch_adr])
+        self.r_foot_force = float(self.data.sensordata[self.r_foot_touch_adr])
+        self.l_force_z0 = min(max(self.l_foot_force / self.desired_max_foot_frc, 0.0), 1.0)
+        self.r_force_z0 = min(max(self.r_foot_force / self.desired_max_foot_frc, 0.0), 1.0)
 
     def get_obs(self):
         root_orient = self.data.qpos[3:7]
@@ -95,7 +112,7 @@ class SimWalkEnv():
     def if_done(self):
         #r_force_z = self.data.sensordata[(self.r_force_sensor_id + 1) * 3 - 1]
         #l_force_z = self.data.sensordata[(self.l_force_sensor_id + 1) * 3 - 1]
-        done = jnp.abs(self.goal_h - self.data.qpos[2]) > 0.08
+        done = jnp.abs(self.goal_h - self.data.qpos[2]) > 0.12
         #print("time", self.time)
         #if self.time>40 and not done:
         #    done = ((jnp.abs(r_force_z)>470) | (jnp.abs(l_force_z)>470))
@@ -114,6 +131,7 @@ class SimWalkEnv():
             mujoco.mj_step(self.model, self.data)
         self.clock = (self.clock + self.control_dt) % self.total_duration
         self.time += 1
+        self.update_foot_force_state()
         obs = self.get_obs()
         #print(self.clock)
         total_reward = 0
@@ -123,13 +141,14 @@ class SimWalkEnv():
 
     def reset(self):
         c = 0.02
-        subkey1, subkey2, subkey3, subkey4, subkey5 = random.split(random.PRNGKey(0), 5)
+        subkey1, subkey2, subkey3, subkey4 = random.split(random.PRNGKey(int(time.time())), 4)
         init_qpos = self.init_qpos + random.uniform(subkey1, shape=(self.model.nq,), minval=-c, maxval=c)
         init_qvel = self.init_qvel + random.uniform(subkey2, shape=(self.model.nv,), minval=-c, maxval=c)
         init_qpos = init_qpos.at[2].set(self.goal_h)
         self.data.qpos[:] = init_qpos
         self.data.qvel[:] = init_qvel
         mujoco.mj_forward(self.model, self.data)
+        self.update_foot_force_state()
         self.goal_speed = random.uniform(subkey3, minval=0.2, maxval=0.4)
         self.clock = random.uniform(subkey4, minval=0, maxval=self.total_duration)
         obs = self.get_obs()

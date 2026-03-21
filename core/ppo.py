@@ -70,16 +70,42 @@ class PPO:
         #FR_EXP_Net(self.env.obs_dim, self.env.act_dim,self.policy_expansion_n)
         self.critic = CRITIC_Net(self.env.obs_dim,self.critic_expansion_n)  # 估算当前状态的价值（即reward）
 
-        if args['continued']:
-            print("load models...")
-            with open(os.path.join(self.save_path, "best_policy.pkl"), 'rb') as f:
-                self.policy_params = pickle.load(f)
-            with open(os.path.join(self.save_path, "best_critic.pkl"), 'rb') as f:
-                self.critic_params = pickle.load(f)
+        resume_dir = self._resolve_resume_dir(args.get('continued', ''))
+        if resume_dir is not None:
+            policy_path = os.path.join(resume_dir, "best_policy.pkl")
+            critic_path = os.path.join(resume_dir, "best_critic.pkl")
+            if os.path.exists(policy_path) and os.path.exists(critic_path):
+                print(f"load models from {resume_dir}...")
+                with open(policy_path, 'rb') as f:
+                    self.policy_params = pickle.load(f)
+                with open(critic_path, 'rb') as f:
+                    self.critic_params = pickle.load(f)
+            else:
+                print(f"resume requested, but weights were not found in {resume_dir}. start from scratch.")
+                self.policy_params = self.policy.init_params()
+                self.critic_params = self.critic.init_params()
         else:
             self.policy_params = self.policy.init_params()  # self.policy_expansion_n
             self.critic_params = self.critic.init_params()
         self.num_samples = self.max_traj_len * self.env_batch_size
+
+    def _resolve_resume_dir(self, continued):
+        if isinstance(continued, str):
+            continued = continued.strip()
+            if continued.lower() in ("", "0", "false", "no", "none"):
+                return None
+            if continued.lower() in ("1", "true", "yes", "auto"):
+                return self.save_path
+            return continued
+        if continued:
+            return self.save_path
+        return None
+
+    def _save_checkpoint(self, prefix):
+        with open(os.path.join(self.save_path, f"{prefix}_policy.pkl"), 'wb') as f:
+            pickle.dump(self.policy_params, f)
+        with open(os.path.join(self.save_path, f"{prefix}_critic.pkl"), 'wb') as f:
+            pickle.dump(self.critic_params, f)
 
 
     def upper_toeplitz_geo(self, n):
@@ -89,7 +115,7 @@ class PPO:
         k = j - i
         return jnp.where(k >= 0, self.gamma ** k, 0.0)
 
-    def sample(self):
+    def sample(self, add_noise=True):
         obs = self.env.reset()
         pool = DataSet(self.env_batch_size, self.max_traj_len, self.env.obs_dim, self.env.act_dim)
         dones = jnp.zeros((self.env_batch_size,1), dtype=bool)
@@ -99,13 +125,15 @@ class PPO:
             actions = self.policy(self.policy_params, prestates)  #输出batch_size*12二维数组
 
             pool.old_act_mu = pool.old_act_mu.at[:, pool.trace_len].set(actions)
-            samples = jax.random.normal(jax.random.PRNGKey(int(time.time())), shape=(self.env.batch_size, self.env.act_dim))
-            actions += self.std * samples  #self.act = jnp.zeros((batch_size, self.act_dim))
+            if add_noise:
+                samples = jax.random.normal(
+                    jax.random.PRNGKey(int(time.time())),
+                    shape=(self.env.batch_size, self.env.act_dim),
+                )
+                actions += self.std * samples #self.act = jnp.zeros((batch_size, self.act_dim))
 
             values = self.critic(self.critic_params, prestates)
-            #jax.debug.print("prestates: {}", prestates)
-            #jax.debug.print("actions: {}", actions[0])
-            #jax.debug.print("values: {}", values[0])
+            
             obs, rewards, dones = self.env.step(actions)
             pool.obs = pool.obs.at[:, pool.trace_len].set(prestates)
             pool.act = pool.act.at[:, pool.trace_len].set(actions)
@@ -125,8 +153,7 @@ class PPO:
 
 
     def calcu_adv(self, policy_params, critic_params,  old_obs_batch,old_act_batch,old_ret_batch,old_val_batch,old_act_mu):
-        #adv_mse_loss = jnp.mean(jnp.square(old_ret_batch - 1))
-        #old_adv_batch = 1- adv_mse_loss
+        
         reshaped_old_obs_batch = jnp.reshape(old_obs_batch, (-1, self.env.obs_dim))
         #reshaped_mirror_old_obs_batch=jnp.reshape(mirror_old_obs_batch, (-1, self.env.obs_dim))
 
@@ -142,12 +169,7 @@ class PPO:
 
         critic_mse_loss = jnp.mean(jnp.square(old_ret_batch - new_val))
         critic_adv = -critic_mse_loss
-        #old_obs_batch = jnp.reshape(old_obs_batch, (old_obs_batch.shape[0]*old_obs_batch.shape[1], self.env.obs_dim))
-        #mirror_old_obs_batch = jnp.matmul(old_obs_batch, self.env.obs_mirror_metrix)
-        #mirror_new_act_mu = self.policy(policy_params, reshaped_mirror_old_obs_batch)
-        #jax.debug.print("mirror_new_act_mu:\n {}", mirror_new_act_mu.shape)
-        #mirror_new_act_mu = jnp.matmul(mirror_new_act_mu, self.env.act_mirror_metrix)
-        #jax.debug.print("mirror_new_act_mu:\n {}", mirror_new_act_mu.shape)
+        
         new_act_mu = self.policy(policy_params, reshaped_old_obs_batch)#.reshape((old_act_mu.shape[0], old_act_mu.shape[1], self.env.act_dim))
         #mirror_mse_loss=jnp.mean(jnp.square(new_act_mu - mirror_new_act_mu))
         #mirror_adv = -mirror_mse_loss
@@ -158,10 +180,8 @@ class PPO:
         log_probs = jnp.mean(norm.logpdf(old_act_batch, loc=new_act_mu, scale=self.std), axis=-1)
         old_log_probs = jnp.mean(norm.logpdf(old_act_batch, loc=old_act_mu, scale=self.std), axis=-1)  #policy网络作出action_batch决策的对数概率
         log_ratio = log_probs - old_log_probs
-        ratio = jnp.exp(log_ratio)  #exp^log(p(x)/q(x))即pdf(action)/old_pdf(action)，重要性采样
-        #approx_kl_div = jnp.mean((ratio - 1) - log_ratio)
-        #jax.debug.print("kl:{}", self.approx_kl_div)
-        #print("ratio\n", ratio)
+        ratio = jnp.exp(log_ratio)  
+
         clip_ratio = jnp.clip(ratio, 1.0 - self.clip, 1.0 + self.clip)
         actor_adv = jnp.minimum(ratio* old_adv_batch, clip_ratio* old_adv_batch)#old_adv_batch>0时ratio和clip_ratio取最小，old_adv_batch<0时ratio和clip_ratio取最大
         #actor_adv = jnp.sum(actor_adv,axis=-1)
@@ -178,90 +198,82 @@ class PPO:
         mean_ret = []
         mean_adv=[]
         trace_len = []
-        for itr in range(self.n_itr):  #self.n_itr
-            if highest_reward > 0.9 and curr_anneal > 0.5:
-                curr_anneal *= self.anneal_rate
-            pool = self.sample()
-            #mirror_old_obs = jnp.matmul(pool.obs, self.env.obs_mirror_metrix)
-            #self.old_policy_params = self.policy_params.copy()
-            total_adv = 0
-            #continue_training = True
-            adv_n = 0
-            for epoch in range(self.epochs):
-                sampler = BatchSampler(self.env_batch_size, self.minibatch_size)
-                for indices in sampler:
-                    #print("indices\n", indices)
-                    #mirror_old_obs_batch = mirror_old_obs[indices,:pool.trace_len]
-                    old_obs_batch = pool.obs[indices,:pool.trace_len]
-                    old_act_batch = pool.act[indices,:pool.trace_len]
-                    old_ret_batch = pool.ret[indices,:pool.trace_len]  # jnp.floor(indices / self.max_traj_len).astype(int)
-                    old_val_batch = pool.val[indices,:pool.trace_len]
-                    old_act_mu = pool.old_act_mu[indices,:pool.trace_len]
-                    adv, grads = (value_and_grad(self.calcu_adv, argnums=(0,1))
-                                  (self.policy_params, self.critic_params, old_obs_batch,old_act_batch,old_ret_batch,old_val_batch,old_act_mu,))
-                    #jax.debug.print("kl:{}", self.approx_kl_div)
-                    #if self.approx_kl_div > self.target_kl:
-                    #    continue_training = False
-                    #    jax.debug.print("Early stopping at max kl:{}", self.approx_kl_div)
-                    #    break
-                    self.policy_params = tree_util.tree_map(lambda p, g: p + self.alr * g, self.policy_params, grads[0])
-                    self.critic_params = tree_util.tree_map(lambda p, g: p + self.clr * g, self.critic_params, grads[1])
-                    '''
-                    for keys in self.policy_params.keys():
-                        jax.debug.print("policy_params {}:{}", keys, jnp.mean(self.policy_params[keys]/grads[0][keys]))
-                    for keys in self.critic_params.keys():
-                        jax.debug.print("critic_params {}:{}", keys, jnp.mean(self.critic_params[keys]/grads[1][keys]))
-                    '''
-                    #jax.debug.print("policy_params:{}", self.policy_params['coefficient1'])
-                    #jax.debug.print("critic_params:{}", self.critic_params)
-                    #jax.debug.print("policy_grads:{}", grads[0]['coefficient4'])
-                    #jax.debug.print("critic_grads:{}", grads[1])
-                    adv_n += 1
-                    total_adv += adv
-                    #'''
-                #if not continue_training:
-                #    break
-            #if itr % self.eval_freq == 0:
-            #jax.debug.print("values: {}", self.pool.val)
-            #jax.debug.print("returns: {}", self.pool.ret)
-            if itr % 10 == 0:
-                print("********** Iteration {} ************".format(itr))
-                print("trace_lens: ", pool.trace_len)
-                print("mean_ret: ", pool.mean_ret)
-                print("mean_val: ", pool.mean_val)
-                print("mean_adv: ", total_adv / adv_n)
-                print()
+        itr = -1
+        try:
+            for itr in range(self.n_itr):  #self.n_itr
+                if highest_reward > 0.9 and curr_anneal > 0.5:
+                    curr_anneal *= self.anneal_rate
+                pool = self.sample(add_noise=True)
 
-            if itr % self.eval_freq == 0:
-                pool = self.sample()
-                #mirror_old_obs = jnp.matmul(pool.obs, self.env.obs_mirror_metrix)
-                adv=self.calcu_adv(self.policy_params, self.critic_params, pool.obs, pool.act, pool.ret, pool.val, pool.old_act_mu)
-                trace_len.append(pool.trace_len)
-                mean_ret.append((pool.mean_ret-10)*10)
-                mean_adv.append(adv)
-                plt.clf()
-                xlabel = [i * self.eval_freq for i in range(len(trace_len))]
-                #plt.plot(xlabel, trace_len, color='blue', marker='o', label='trace_lens')
-                #plt.plot(xlabel, mean_values, color='blue', marker='o', label='mean_values')
-                plt.plot(xlabel, mean_ret, color='green', marker='o', label='mean_ret')
-                #plt.plot(xlabel, mean_adv, color='red', marker='o', label='mean_adv')
-                plt.legend()
-                plt.savefig("trained/eval.jpg", bbox_inches='tight')
-                if highest_reward < pool.mean_ret:
-                    highest_reward = pool.mean_ret
-                    # 保存参数到文件
-                    with open(os.path.join(self.save_path, "best_policy.pkl"), 'wb') as f:
-                        pickle.dump(self.policy_params, f)
-                    with open(os.path.join(self.save_path, "best_critic.pkl"), 'wb') as f:
-                        pickle.dump(self.critic_params, f)
-                    #print("save best model ", highest_reward)
-                    jax.debug.print("save best model: {}", pool.mean_ret)
+                total_adv = 0
+                #continue_training = True
+                adv_n = 0
+                for epoch in range(self.epochs):
+                    sampler = BatchSampler(self.env_batch_size, self.minibatch_size)
+                    for indices in sampler:
+
+                        old_obs_batch = pool.obs[indices,:pool.trace_len]
+                        old_act_batch = pool.act[indices,:pool.trace_len]
+                        old_ret_batch = pool.ret[indices,:pool.trace_len]  # jnp.floor(indices / self.max_traj_len).astype(int)
+                        old_val_batch = pool.val[indices,:pool.trace_len]
+                        old_act_mu = pool.old_act_mu[indices,:pool.trace_len]
+                        adv, grads = (value_and_grad(self.calcu_adv, argnums=(0,1))
+                                      (self.policy_params, self.critic_params, old_obs_batch,old_act_batch,old_ret_batch,old_val_batch,old_act_mu,))
+
+                        self.policy_params = tree_util.tree_map(lambda p, g: p + self.alr * g, self.policy_params, grads[0])
+                        self.critic_params = tree_util.tree_map(lambda p, g: p + self.clr * g, self.critic_params, grads[1])
+                        '''
+                        for keys in self.policy_params.keys():
+                            jax.debug.print("policy_params {}:{}", keys, jnp.mean(self.policy_params[keys]/grads[0][keys]))
+                        for keys in self.critic_params.keys():
+                            jax.debug.print("critic_params {}:{}", keys, jnp.mean(self.critic_params[keys]/grads[1][keys]))
+                        '''
+
+                        adv_n += 1
+                        total_adv += adv
+
+                if itr % 10 == 0:
+                    print("********** Iteration {} ************".format(itr))
+                    print("trace_lens: ", pool.trace_len)
+                    print("mean_ret: ", pool.mean_ret)
+                    print("mean_val: ", pool.mean_val)
+                    print("mean_adv: ", total_adv / adv_n)
                     print()
-                else:
-                    with open(os.path.join(self.save_path, "last_policy.pkl"), 'wb') as f:
-                        pickle.dump(self.policy_params, f)
-                    with open(os.path.join(self.save_path, "last_critic.pkl"), 'wb') as f:
-                        pickle.dump(self.critic_params, f)
-                    #print("save last model ", pool.mean_ret)
-                    jax.debug.print("save last model: {}", pool.mean_ret)
-                    print()
+
+                if itr % self.eval_freq == 0:
+                    pool = self.sample(add_noise=False)
+                    # Eval diagnostics do not need the full env batch; a small slice avoids OOM.
+                    eval_batch_size = min(self.minibatch_size, pool.obs.shape[0])
+                    adv = self.calcu_adv(
+                        self.policy_params,
+                        self.critic_params,
+                        pool.obs[:eval_batch_size],
+                        pool.act[:eval_batch_size],
+                        pool.ret[:eval_batch_size],
+                        pool.val[:eval_batch_size],
+                        pool.old_act_mu[:eval_batch_size],
+                    )
+                    trace_len.append(pool.trace_len)
+                    mean_ret.append((pool.mean_ret-10)*10)
+                    mean_adv.append(adv)
+                    plt.clf()
+                    xlabel = [i * self.eval_freq for i in range(len(trace_len))]
+                    #plt.plot(xlabel, trace_len, color='blue', marker='o', label='trace_lens')
+                    #plt.plot(xlabel, mean_values, color='blue', marker='o', label='mean_values')
+                    plt.plot(xlabel, mean_ret, color='green', marker='o', label='mean_ret')
+                    #plt.plot(xlabel, mean_adv, color='red', marker='o', label='mean_adv')
+                    plt.legend()
+                    plt.savefig(os.path.join(self.save_path, "eval.jpg"), bbox_inches='tight')
+                    if highest_reward < pool.mean_ret:
+                        highest_reward = pool.mean_ret
+                        self._save_checkpoint("best")
+                        print("save best model:", float(pool.mean_ret))
+                        print()
+                    else:
+                        self._save_checkpoint("last")
+                        print("save last model:", float(pool.mean_ret))
+                        print()
+        except KeyboardInterrupt:
+            self._save_checkpoint("interrupt")
+            print("\nKeyboardInterrupt at iteration {}. Saved interrupt_policy.pkl and interrupt_critic.pkl.".format(itr))
+            raise

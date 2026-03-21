@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3, help="Number of optimization epochs per PPO update")
     parser.add_argument("--use_gae", type=bool, default=True,help="Whether or not to calculate returns using Generalized Advantage Estimation")
     parser.add_argument("--max_grad_norm", type=float, default=0.05, help="Value to clip gradients at.")
-    parser.add_argument("--max_traj_len", type=int, default=512, help="Max episode horizon")#每轮采样都是self.n_proc * self.max_traj_len个176
+    parser.add_argument("--max_traj_len", type=int, default=256, help="Max episode horizon")#每轮采样都是self.n_proc * self.max_traj_len个176
     parser.add_argument("--eval_freq", required=False, default=20, type=int, help="Frequency of performing evaluation")
     parser.add_argument(
         "--continued",
@@ -29,10 +29,10 @@ if __name__ == "__main__":
         type=str,
         help="Resume training. Use '--continued' to load from save_dir, or '--continued PATH' to load from another directory.",
     )
-    parser.add_argument("--env_batch_size", required=False, default=128, type=int, help="path to pretrained weights")
+    parser.add_argument("--env_batch_size", required=False, default=1024, type=int, help="path to pretrained weights")
     parser.add_argument("--target_kl", required=False, default=0.2, type=float, help="limit on the kl div")
-    parser.add_argument("--policy_expansion_n", required=False, default=32, type=int)
-    parser.add_argument("--critic_expansion_n", required=False, default=32, type=int)
+    parser.add_argument("--policy_expansion_n", required=False, default=64, type=int)
+    parser.add_argument("--critic_expansion_n", required=False, default=64, type=int)
     args = parser.parse_args()
     algo = PPO(args=vars(args))
     algo.train()

@@ -20,6 +20,10 @@ class WalkEnv():
         self.root_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'pelvis')
         self.r_foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'right_ankle_roll_link')
         self.l_foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'left_ankle_roll_link')
+        self.l_foot_touch_sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, 'left_foot_touch')
+        self.r_foot_touch_sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, 'right_foot_touch')
+        self.l_foot_touch_adr = int(model.sensor_adr[self.l_foot_touch_sensor_id])
+        self.r_foot_touch_adr = int(model.sensor_adr[self.r_foot_touch_sensor_id])
         self.nq = model.nq
         self.nv = model.nv
         self.goal_h = 0.756
@@ -34,7 +38,12 @@ class WalkEnv():
                                        ])
         self.init_qpos = jnp.concatenate([jnp.array([0, 0, self.goal_h, 1, 0, 0, 0]),self.motor_offset])
         self.gear_ratios = model.actuator_gear[:, 0]
+        self.gravity = abs(model.opt.gravity[2])
         self.mass = mujoco.mj_getTotalmass(model)
+        self.body_weight = self.mass * self.gravity
+        self.double_support_foot_frc = 0.5 * self.body_weight
+        self.single_support_foot_frc = self.body_weight
+        self.desired_max_foot_frc = 1.2 * self.body_weight
         #print("mass\n", self.mass)
         self.frame_skip = int(self.control_dt / self.sim_dt)
         self.kp0 = jnp.array([110, 110, 110, 130, 40, 20,
@@ -49,9 +58,7 @@ class WalkEnv():
         self.model = mjx.put_model(model)  # 移到gpu
         self.batched_init_data = jax.jit(jax.vmap(self.init_data, in_axes=(0,0,0)))
         self.batched_step_data = jax.jit(jax.vmap(self.step_data, in_axes=(0,0)))
-        self.desired_max_foot_frc = self.mass * 9.8 * 0.5
-        #self.r_force_z0 = None
-        #self.l_force_z0 = None
+      
 
         #构造镜像矩阵
         '''
@@ -83,7 +90,17 @@ class WalkEnv():
         self.min_speed=0.2
         self.max_speed=0.4
         self.clock = jnp.zeros((batch_size,1))
+        self.l_foot_force = jnp.zeros((batch_size,))
+        self.r_foot_force = jnp.zeros((batch_size,))
+        self.l_force_z0 = jnp.zeros((batch_size,))
+        self.r_force_z0 = jnp.zeros((batch_size,))
         self.reward = Reward(self)
+    def update_foot_force_state(self):
+        self.l_foot_force = self.data.sensordata[:, self.l_foot_touch_adr]
+        self.r_foot_force = self.data.sensordata[:, self.r_foot_touch_adr]
+        self.l_force_z0 = jnp.clip(self.l_foot_force / self.desired_max_foot_frc, 0.0, 1.0)
+        self.r_force_z0 = jnp.clip(self.r_foot_force / self.desired_max_foot_frc, 0.0, 1.0)
+
         self.time_step = 0
         #print(jax.devices())
 
@@ -110,12 +127,10 @@ class WalkEnv():
         #print("tau", tau)
         self.clock = (self.clock + self.control_dt) % self.total_duration
         self.time_step += 1
+        self.update_foot_force_state()
         motor_pos = self.data.actuator_length / self.gear_ratios
         motor_vel = self.data.actuator_velocity / self.gear_ratios
-        #process = self.clock / self.total_duration
-        #jax.debug.print("motor_vel:  {}", motor_pos[0])
-        #jax.debug.print("motor_vel:  {}", motor_vel[0])
-        #desired_tau=desired_ctrl* self.gear_ratios
+
         roll = jnp.atan2(self.data.xmat[:,self.root_id,2,1], self.data.xmat[:,self.root_id,2,2])
         pitch = jnp.asin(-self.data.xmat[:,self.root_id,2,0])
         yaw = jnp.atan2(self.data.xmat[:,self.root_id,1,0], self.data.xmat[:,self.root_id,0,0])
@@ -143,6 +158,7 @@ class WalkEnv():
         vel = random.uniform(subkey2, (self.batch_size,self.nv), minval=-0.02, maxval=0.02)
         pos = pos.at[:,2].set(self.goal_h)
         self.data = self.batched_init_data(self.data,pos,vel)
+        self.update_foot_force_state()
         self.goal_speed = random.uniform(subkey3,(self.batch_size,1), minval=self.min_speed, maxval=self.max_speed)
         self.clock = random.uniform(subkey4, (self.batch_size,1), minval=0, maxval=self.total_duration)
         #self.clock = jnp.zeros((self.batch_size,1))
@@ -165,41 +181,3 @@ class WalkEnv():
 
 
 
-
-
-'''
-env = WalkEnv(4)
-env.reset()
-action=random.uniform(random.PRNGKey(0), shape=(env.batch_size, env.act_dim), minval=-0.3, maxval=0.3)
-out=env.step(action)
-#print(out)
-'''
-'''
-    def get_obs(self,data, clock, goal_speed):
-        root_orient = data.qpos[3:7]
-        root_ang_vel = data.qvel[3:6]
-        motor_pos = data.actuator_length/self.gear_ratios
-        motor_vel = data.actuator_velocity/self.gear_ratios
-        process = clock / self.total_duration
-        obs = jnp.concatenate([root_orient, root_ang_vel, motor_pos, motor_vel, jnp.array([goal_speed, #process], axis=1)
-                               jnp.sin(2 * jnp.pi * process), jnp.cos(2 * jnp.pi * process)])])
-        return obs
-'''
-#cond = (self.data.contact.geom1 == self.floor_geom_id) | (self.data.contact.geom2 == self.floor_geom_id)
-#contact_flag = jnp.any(~cond, axis=1)
-#print("self.data.contact.geom1",self.data.contact.geom1)
-#print("self.data.contact.geom2",self.data.contact.geom2)
-#body1id,body2id=self.batched_check_self_collision(self.data)
-#print("body1id[0]", body1id)
-#print("body2id[0]", body2id)
-#cond=(self.model.geom_bodyid[self.data.contact.geom1] == self.floor_id) | (self.model.geom_bodyid[self.data.contact.geom2] == self.floor_id)
-#con_num=jnp.sum(jnp.array(cond),axis=1)
-#contact_flag = (con_num!=self.data.ncon)
-#contact_flag = False
-#body1id=jnp.where(cond,int(0),self.model.geom_bodyid[self.data.contact.geom1])
-#body2id = jnp.where(cond, int(0), self.model.geom_bodyid[self.data.contact.geom2])
-#print(body1id)
-#print(body2id)
-#print(mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body1id))
-#print(jnp.where(cond, -1, self.data.contact.geom1))
-#print(jnp.where(cond, -1, self.data.contact.geom2))
