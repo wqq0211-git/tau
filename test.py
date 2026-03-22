@@ -11,6 +11,13 @@ from core.convnet import ACTOR_Net
 from core.sim_walkenv import SimWalkEnv
 
 
+def infer_policy_width(policy_params: dict) -> int:
+    coefficient1 = policy_params.get("coefficient1")
+    if coefficient1 is None:
+        raise ValueError("policy_params missing coefficient1; cannot infer network width")
+    return int(coefficient1.shape[-1])
+
+
 def resolve_policy_path(policy_path: str | None) -> str | None:
     if policy_path and policy_path != "auto":
         return policy_path
@@ -27,16 +34,18 @@ def resolve_policy_path(policy_path: str | None) -> str | None:
 
 def run(policy_path: str | None, seconds: float, pause: bool):
     env = SimWalkEnv()
-    policy = ACTOR_Net(env.obs_dim, env.act_dim, 32)
+    policy = None
     policy_params = None
     resolved_policy_path = resolve_policy_path(policy_path)
     if resolved_policy_path and os.path.exists(resolved_policy_path):
         print(f"using policy: {resolved_policy_path}")
         with open(resolved_policy_path, 'rb') as f:
             policy_params = pickle.load(f)
+        expansion_n = infer_policy_width(policy_params)
+        print(f"inferred policy width: {expansion_n}")
+        policy = ACTOR_Net(env.obs_dim, env.act_dim, expansion_n)
     else:
         print("no policy found, using zero actions")
-        policy = None
 
     states = env.reset()
     env.viewer.render()
